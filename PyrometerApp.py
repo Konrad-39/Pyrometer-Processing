@@ -24,7 +24,7 @@ class PyrometerApp:
         self.snr_threshold = tk.DoubleVar(value=1.0)
         self.snr_percentage = tk.DoubleVar(value=50.0)
         # self.cal_temperature = tk.DoubleVar(value=2796.0)  # ADD THIS LINE
-        self.smoothing_window = tk.IntVar(value=15)
+        self.smoothing_window = tk.IntVar(value=100)
         # Multiple calibration temperatures
         self.calibration_temps = []  # List of (temperature, description) tuples
         self.add_default_calibration()
@@ -516,8 +516,10 @@ class PyrometerApp:
         
         ttk.Button(control_frame, text="Save Plot", 
                 command=self.save_results).pack(side='left', padx=5)
-        ttk.Button(control_frame, text="Export Data", 
+        ttk.Button(control_frame, text="Export All Data", 
                 command=self.export_data).pack(side='left', padx=5)
+        ttk.Button(control_frame, text="Export Plot Data", 
+                command=self.export_individual_plots_data).pack(side='left', padx=5)  # NEW BUTTON
         ttk.Button(control_frame, text="Refresh Plot", 
                 command=self.refresh_plot).pack(side='left', padx=5)
         ttk.Button(control_frame, text="Plot SNR vs Time", 
@@ -1218,6 +1220,136 @@ class PyrometerApp:
         except Exception as e:
             messagebox.showerror("Error", f"Error saving plot: {str(e)}")
     
+    def export_individual_plots_data(self):
+        """Export data for each plot separately as CSV files"""
+        
+        if not hasattr(self, 'temperature_results'):
+            messagebox.showerror("Error", "No data to export! Calculate temperature first.")
+            return
+        
+        try:
+            # Ask user to select directory for saving multiple files
+            save_directory = filedialog.askdirectory(
+                title="Select Directory to Save Plot Data Files"
+            )
+            
+            if not save_directory:
+                return
+            
+            results = self.temperature_results
+            timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+            
+            # 1. Export Temperature Plot Data
+            temp_data = {'Time_s': results['time']}
+            
+            if results['has_uncertainty']:
+                temp_data['Temperature_Mean_K'] = results['temperature_mean']
+                temp_data['Temperature_Std_K'] = results['temperature_std']
+                temp_data['Temperature_Upper_1sigma_K'] = results['temperature_mean'] + results['temperature_std']
+                temp_data['Temperature_Lower_1sigma_K'] = results['temperature_mean'] - results['temperature_std']
+                temp_data['Temperature_Upper_2sigma_K'] = results['temperature_mean'] + 2*results['temperature_std']
+                temp_data['Temperature_Lower_2sigma_K'] = results['temperature_mean'] - 2*results['temperature_std']
+                
+                # Add individual calibration results
+                for i, description in enumerate(results['temperature_descriptions']):
+                    clean_desc = description.replace(' ', '_').replace('(', '').replace(')', '').replace('.', '')
+                    temp_data[f'Temperature_{clean_desc}_K'] = results['temperature_individual'][i]
+            else:
+                temp_data['Temperature_K'] = results['temperature']
+            
+            temp_df = pd.DataFrame(temp_data)
+            temp_filename = os.path.join(save_directory, f"temperature_plot_data_{timestamp}.csv")
+            temp_df.to_csv(temp_filename, index=False)
+            
+            # 2. Export Detector Signals Plot Data
+            signal_data = {'Time_s': results['time']}
+            
+            for i, (detector, signal) in enumerate(results['corrected_signals'].items()):
+                wavelength = results['wavelengths'][i]
+                signal_data[f'{detector}_Signal_{wavelength:.1f}nm'] = signal
+            
+            # Add ratios
+            if len(results['corrected_signals']) >= 2:
+                detector_names = list(results['corrected_signals'].keys())
+                ratio = results['corrected_signals'][detector_names[0]] / results['corrected_signals'][detector_names[1]]
+                signal_data[f'Ratio_{detector_names[0]}_{detector_names[1]}'] = ratio
+                
+                # Scaled ratio for plotting
+                ratio_scaled = ratio * np.mean(list(results['corrected_signals'].values())) / np.mean(ratio)
+                signal_data[f'Ratio_{detector_names[0]}_{detector_names[1]}_Scaled_for_Plot'] = ratio_scaled
+            
+            signal_df = pd.DataFrame(signal_data)
+            signal_filename = os.path.join(save_directory, f"detector_signals_plot_data_{timestamp}.csv")
+            signal_df.to_csv(signal_filename, index=False)
+            
+            # 3. Export SNR Plot Data
+            if hasattr(self, 'snr_results') and 'experimental' in self.snr_results:
+                snr_data = {}
+                
+                for detector, snr_info in self.snr_results['experimental'].items():
+                    if 'rolling_snr' in snr_info['metrics']:
+                        rolling_snr = snr_info['metrics']['rolling_snr']
+                        window_size = snr_info['metrics']['window_size']
+                        
+                        # Create time axis for rolling SNR (centered in windows)
+                        time_data = snr_info['time']
+                        rolling_time = time_data[window_size//2:window_size//2 + len(rolling_snr)]
+                        
+                        # Get wavelength for column name
+                        wavelength = self.detector_wavelengths.get(detector, tk.DoubleVar(value=0)).get()
+                        
+                        # Store data (pad to same length)
+                        if 'Time_s' not in snr_data:
+                            snr_data['Time_s'] = rolling_time
+                            snr_data['SNR_Threshold'] = [self.snr_threshold.get()] * len(rolling_time)
+                        
+                        snr_data[f'{detector}_Rolling_SNR_{wavelength:.0f}nm'] = rolling_snr
+                        snr_data[f'{detector}_Percentage_Good_Time'] = [snr_info['metrics']['percentage_good']] * len(rolling_snr)
+                
+                if snr_data:
+                    snr_df = pd.DataFrame(snr_data)
+                    snr_filename = os.path.join(save_directory, f"snr_plot_data_{timestamp}.csv")
+                    snr_df.to_csv(snr_filename, index=False)
+                
+                files_created = [temp_filename, signal_filename, snr_filename]
+            else:
+                files_created = [temp_filename, signal_filename]
+            
+            # Create summary file
+            summary_filename = os.path.join(save_directory, f"plot_data_summary_{timestamp}.txt")
+            with open(summary_filename, 'w') as f:
+                f.write("PYROMETER PLOT DATA EXPORT SUMMARY\n")
+                f.write("="*50 + "\n\n")
+                f.write(f"Export Date: {pd.Timestamp.now()}\n")
+                f.write(f"Analysis Parameters:\n")
+                f.write(f"  - Detectors Used: {', '.join(results['detectors_used'])}\n")
+                f.write(f"  - Wavelengths: {results['wavelengths']} nm\n")
+                f.write(f"  - SNR Threshold: {self.snr_threshold.get()}\n")
+                f.write(f"  - SNR Percentage Threshold: {self.snr_percentage.get()}%\n")
+                f.write(f"  - Smoothing Window: {self.smoothing_window.get()} data points\n")
+                f.write(f"  - Calibration Temperatures: {[temp for temp, _ in self.calibration_temps]} K\n\n")
+                
+                f.write("Files Created:\n")
+                for i, filename in enumerate(files_created, 1):
+                    f.write(f"  {i}. {os.path.basename(filename)}\n")
+                
+                f.write(f"\nSmoothing Window Explanation:\n")
+                f.write(f"  - Value: {self.smoothing_window.get()} data points\n")
+                f.write(f"  - Type: Gaussian filter sigma parameter\n")
+                f.write(f"  - Effect: Smooths temperature data over ~{self.smoothing_window.get()} neighboring points\n")
+                f.write(f"  - Higher values = more smoothing, lower values = less smoothing\n")
+            
+            files_created.append(summary_filename)
+            
+            messagebox.showinfo("Export Complete", 
+                            f"Plot data exported successfully!\n\n"
+                            f"Files created:\n" + 
+                            "\n".join([f"• {os.path.basename(f)}" for f in files_created]) +
+                            f"\n\nLocation: {save_directory}")
+            
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Error exporting plot data: {str(e)}")
+
     def export_data(self):
         """Export temperature and signal data to CSV"""
         
