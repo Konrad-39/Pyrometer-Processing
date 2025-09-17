@@ -7,6 +7,7 @@ import numpy as np
 import os
 import glob
 from scipy.ndimage import gaussian_filter1d
+from scipy.optimize import fsolve, root_scalar
 
 class PyrometerApp:
     def __init__(self, root):
@@ -39,9 +40,6 @@ class PyrometerApp:
         self.setup_gui()
         self.update_detector_settings()
     
-    def add_default_calibration(self):
-        """Add default calibration temperature"""
-        self.calibration_temps = [(2796.0, "Grey body source")]
     
     def setup_gui(self):
         """Setup the main GUI layout"""
@@ -148,6 +146,44 @@ class PyrometerApp:
         """
         
         ttk.Label(instructions, text=instruction_text, justify='left').pack(padx=10, pady=10)
+
+        window_frame = ttk.LabelFrame(self.setup_frame, text="Polycarbonate Window Correction")
+        window_frame.pack(fill='x', padx=10, pady=10)
+        
+        # Enable/disable window correction
+        self.enable_window_correction = tk.BooleanVar(value=False)
+        ttk.Checkbutton(window_frame, text="Apply window transmission correction",
+                    variable=self.enable_window_correction).grid(row=0, column=0, columnspan=4, sticky='w', padx=5, pady=5)
+        
+        # Reference thickness for transmission values
+        ttk.Label(window_frame, text="Reference Thickness (mm):").grid(row=1, column=0, sticky='w', padx=5, pady=5)
+        self.reference_thickness = tk.DoubleVar(value=3.0)
+        ttk.Entry(window_frame, textvariable=self.reference_thickness, width=8).grid(row=1, column=1, sticky='w', padx=5, pady=5)
+        ttk.Label(window_frame, text="(thickness at which transmission values were measured)").grid(row=1, column=2, columnspan=2, sticky='w', padx=5, pady=5)
+        
+        # Actual window thickness
+        ttk.Label(window_frame, text="Actual Window Thickness (mm):").grid(row=2, column=0, sticky='w', padx=5, pady=5)
+        self.actual_thickness = tk.DoubleVar(value=3.0)
+        ttk.Entry(window_frame, textvariable=self.actual_thickness, width=8).grid(row=2, column=1, sticky='w', padx=5, pady=5)
+        ttk.Label(window_frame, text="(your actual window thickness)").grid(row=2, column=2, columnspan=2, sticky='w', padx=5, pady=5)
+        
+        # Detector transmission values frame
+        self.transmission_frame = ttk.LabelFrame(window_frame, text="Detector Transmission Values")
+        self.transmission_frame.grid(row=3, column=0, columnspan=4, sticky='ew', padx=5, pady=10)
+        
+        # Storage for transmission values
+        self.detector_transmissions = {}
+        
+        # Instructions
+        instructions_text = """
+    Instructions:
+    1. Enter the reference thickness (thickness at which your transmission values were measured)
+    2. Enter your actual window thickness
+    3. Input transmission values (0.0 to 1.0) for each detector wavelength
+    4. Transmission will be automatically adjusted for thickness difference using Beer-Lambert law
+        """
+        
+        ttk.Label(window_frame, text=instructions_text, justify='left', font=('Arial', 9)).grid(row=4, column=0, columnspan=4, sticky='w', padx=5, pady=5)
     
     def add_calibration_temp(self):
         """Add a new calibration temperature"""
@@ -174,19 +210,27 @@ class PyrometerApp:
             self.cal_listbox.insert(tk.END, f"{temp:.1f}K - {description}")
     
     def update_detector_settings(self):
-        """Update detector wavelength settings based on number of detectors"""
+        """Update detector wavelength settings and transmission inputs"""
         
         # Clear existing wavelength widgets
         for widget in self.wavelength_frame.winfo_children():
             widget.destroy()
         
+        # Clear existing transmission widgets
+        if hasattr(self, 'transmission_frame'):
+            for widget in self.transmission_frame.winfo_children():
+                widget.destroy()
+        
         num_det = self.num_detectors.get()
         self.detector_wavelengths = {}
+        self.detector_transmissions = {}
         
         if num_det == 3:
-            # Default wavelengths for 2-color
+            # === 3-COLOR SYSTEM ===
             default_wavelengths = [800, 1100, 1400]
+            default_transmissions = [0.85, 0.82, 0.75]  # Typical polycarbonate values
             
+            # WAVELENGTH INPUTS
             for i in range(3):
                 detector_name = f"detector{i+1}"
                 
@@ -197,9 +241,60 @@ class PyrometerApp:
                 
                 ttk.Entry(self.wavelength_frame, textvariable=wavelength_var, width=10).grid(row=i, column=1, sticky='w', padx=5, pady=5)
                 ttk.Label(self.wavelength_frame, text="nm").grid(row=i, column=2, sticky='w', padx=5, pady=5)
+            
+            # TRANSMISSION INPUTS (3 detectors)
+            if hasattr(self, 'transmission_frame'):
+                ttk.Label(self.transmission_frame, text="Detector", font=('Arial', 9, 'bold')).grid(row=0, column=0, padx=5, pady=2)
+                ttk.Label(self.transmission_frame, text="Wavelength", font=('Arial', 9, 'bold')).grid(row=0, column=1, padx=5, pady=2)
+                ttk.Label(self.transmission_frame, text="Transmission", font=('Arial', 9, 'bold')).grid(row=0, column=2, padx=5, pady=2)
+                ttk.Label(self.transmission_frame, text="(0.0 - 1.0)", font=('Arial', 8)).grid(row=0, column=3, padx=5, pady=2)
+                
+                for i in range(3):
+                    detector_name = f"detector{i+1}"
+                    
+                    # Detector label
+                    ttk.Label(self.transmission_frame, text=f"C{i+1}").grid(row=i+1, column=0, sticky='w', padx=5, pady=2)
+                    
+                    # Wavelength display (updates automatically)
+                    wavelength_display = ttk.Label(self.transmission_frame, text=f"{default_wavelengths[i]:.0f}nm")
+                    wavelength_display.grid(row=i+1, column=1, sticky='w', padx=5, pady=2)
+                    
+                    # Transmission input
+                    transmission_var = tk.DoubleVar(value=default_transmissions[i])
+                    self.detector_transmissions[detector_name] = transmission_var
+                    
+                    entry = ttk.Entry(self.transmission_frame, textvariable=transmission_var, width=8)
+                    entry.grid(row=i+1, column=2, sticky='w', padx=5, pady=2)
+                    
+                    # Status indicator
+                    status_label = ttk.Label(self.transmission_frame, text="✓", foreground="green")
+                    status_label.grid(row=i+1, column=3, sticky='w', padx=5, pady=2)
+                    
+                    # Update wavelength display when wavelength changes
+                    def create_wavelength_updater(detector=detector_name, display=wavelength_display, status=status_label):
+                        def update_display(*args):
+                            try:
+                                wavelength = self.detector_wavelengths[detector].get()
+                                display.config(text=f"{wavelength:.0f}nm")
+                                
+                                # Update status based on transmission value
+                                transmission = self.detector_transmissions[detector].get()
+                                if 0.0 < transmission <= 1.0:
+                                    status.config(text="✓", foreground="green")
+                                else:
+                                    status.config(text="✗", foreground="red")
+                            except:
+                                status.config(text="?", foreground="orange")
+                        return update_display
+                    
+                    # Bind both wavelength and transmission changes
+                    self.detector_wavelengths[detector_name].trace('w', create_wavelength_updater())
+                    self.detector_transmissions[detector_name].trace('w', create_wavelength_updater())
         
         elif num_det == 32:
-            # Create scrollable frame for 32 detectors
+            # === 32-COLOR SYSTEM ===
+            
+            # WAVELENGTH INPUTS (scrollable)
             canvas = tk.Canvas(self.wavelength_frame, height=200)
             scrollbar = ttk.Scrollbar(self.wavelength_frame, orient="vertical", command=canvas.yview)
             scrollable_frame = ttk.Frame(canvas)
@@ -212,36 +307,233 @@ class PyrometerApp:
             canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
             canvas.configure(yscrollcommand=scrollbar.set)
             
-            # Default wavelengths for 32-color (visible to near-IR spectrum)
-            start_wavelength = 400  # nm
-            end_wavelength = 1100   # nm
+            # Default wavelengths for 32-color
+            start_wavelength = 400
+            end_wavelength = 1100
             wavelength_step = (end_wavelength - start_wavelength) / 31
             
-            # Create wavelength entries in a grid
+            # Create wavelength entries in a grid (8 columns: 4 detectors per row)
             for i in range(32):
                 detector_name = f"detector{i+1}"
                 default_wavelength = start_wavelength + i * wavelength_step
                 
                 row = i // 4
-                col = (i % 4) * 3
+                col = (i % 4) * 3  # 3 columns per detector (label, entry, unit)
                 
                 ttk.Label(scrollable_frame, text=f"C{i+1}:").grid(row=row, column=col, sticky='w', padx=2, pady=2)
                 
                 wavelength_var = tk.DoubleVar(value=round(default_wavelength, 1))
                 self.detector_wavelengths[detector_name] = wavelength_var
                 
-                entry = ttk.Entry(scrollable_frame, textvariable=wavelength_var, width=8)
-                entry.grid(row=row, column=col+1, sticky='w', padx=2, pady=2)
+                ttk.Entry(scrollable_frame, textvariable=wavelength_var, width=6).grid(row=row, column=col+1, sticky='w', padx=2, pady=2)
                 ttk.Label(scrollable_frame, text="nm").grid(row=row, column=col+2, sticky='w', padx=2, pady=2)
             
             canvas.pack(side="left", fill="both", expand=True)
             scrollbar.pack(side="right", fill="y")
             
-            # Add mouse wheel scrolling
+            # TRANSMISSION INPUTS (32 detectors - also scrollable)
+            if hasattr(self, 'transmission_frame'):
+                # Create scrollable transmission frame
+                trans_canvas = tk.Canvas(self.transmission_frame, height=300)
+                trans_scrollbar = ttk.Scrollbar(self.transmission_frame, orient="vertical", command=trans_canvas.yview)
+                trans_scrollable_frame = ttk.Frame(trans_canvas)
+                
+                trans_scrollable_frame.bind(
+                    "<Configure>",
+                    lambda e: trans_canvas.configure(scrollregion=trans_canvas.bbox("all"))
+                )
+                
+                trans_canvas.create_window((0, 0), window=trans_scrollable_frame, anchor="nw")
+                trans_canvas.configure(yscrollcommand=trans_scrollbar.set)
+                
+                # Headers
+                ttk.Label(trans_scrollable_frame, text="Det", font=('Arial', 8, 'bold')).grid(row=0, column=0, padx=2, pady=2)
+                ttk.Label(trans_scrollable_frame, text="λ(nm)", font=('Arial', 8, 'bold')).grid(row=0, column=1, padx=2, pady=2)
+                ttk.Label(trans_scrollable_frame, text="Trans", font=('Arial', 8, 'bold')).grid(row=0, column=2, padx=2, pady=2)
+                ttk.Label(trans_scrollable_frame, text="✓", font=('Arial', 8, 'bold')).grid(row=0, column=3, padx=2, pady=2)
+                
+                # Repeat headers every 8 rows for readability
+                for header_row in range(8, 40, 8):
+                    if header_row < 32:
+                        ttk.Label(trans_scrollable_frame, text="Det", font=('Arial', 8, 'bold')).grid(row=header_row+1, column=0, padx=2, pady=2)
+                        ttk.Label(trans_scrollable_frame, text="λ(nm)", font=('Arial', 8, 'bold')).grid(row=header_row+1, column=1, padx=2, pady=2)
+                        ttk.Label(trans_scrollable_frame, text="Trans", font=('Arial', 8, 'bold')).grid(row=header_row+1, column=2, padx=2, pady=2)
+                        ttk.Label(trans_scrollable_frame, text="✓", font=('Arial', 8, 'bold')).grid(row=header_row+1, column=3, padx=2, pady=2)
+                
+                # Create transmission entries for all 32 detectors
+                for i in range(32):
+                    detector_name = f"detector{i+1}"
+                    default_wavelength = start_wavelength + i * wavelength_step
+                    
+                    # Estimate transmission based on wavelength
+                    if default_wavelength < 600:
+                        default_transmission = 0.88
+                    elif default_wavelength < 800:
+                        default_transmission = 0.86
+                    elif default_wavelength < 1000:
+                        default_transmission = 0.83
+                    else:
+                        default_transmission = 0.78
+                    
+                    # Calculate row (skip header rows)
+                    display_row = i + 1 + (i // 8)  # Add extra row for every 8 detectors (headers)
+                    
+                    # Detector number
+                    ttk.Label(trans_scrollable_frame, text=f"C{i+1}").grid(row=display_row, column=0, sticky='w', padx=2, pady=1)
+                    
+                    # Wavelength display
+                    wavelength_display = ttk.Label(trans_scrollable_frame, text=f"{default_wavelength:.0f}")
+                    wavelength_display.grid(row=display_row, column=1, sticky='w', padx=2, pady=1)
+                    
+                    # Transmission input
+                    transmission_var = tk.DoubleVar(value=default_transmission)
+                    self.detector_transmissions[detector_name] = transmission_var
+                    
+                    entry = ttk.Entry(trans_scrollable_frame, textvariable=transmission_var, width=6, font=('Arial', 8))
+                    entry.grid(row=display_row, column=2, sticky='w', padx=2, pady=1)
+                    
+                    # Status indicator
+                    status_label = ttk.Label(trans_scrollable_frame, text="✓", foreground="green", font=('Arial', 8))
+                    status_label.grid(row=display_row, column=3, sticky='w', padx=2, pady=1)
+                    
+                    # Update functions
+                    def create_32_channel_updater(detector=detector_name, display=wavelength_display, status=status_label):
+                        def update_display(*args):
+                            try:
+                                wavelength = self.detector_wavelengths[detector].get()
+                                display.config(text=f"{wavelength:.0f}")
+                                
+                                transmission = self.detector_transmissions[detector].get()
+                                if 0.0 < transmission <= 1.0:
+                                    status.config(text="✓", foreground="green")
+                                else:
+                                    status.config(text="✗", foreground="red")
+                            except:
+                                status.config(text="?", foreground="orange")
+                        return update_display
+                    
+                    self.detector_wavelengths[detector_name].trace('w', create_32_channel_updater())
+                    self.detector_transmissions[detector_name].trace('w', create_32_channel_updater())
+                
+                trans_canvas.pack(side="left", fill="both", expand=True)
+                trans_scrollbar.pack(side="right", fill="y")
+                
+            # Add mouse wheel scrolling for both canvases
             def _on_mousewheel(event):
                 canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+                if hasattr(self, 'transmission_frame'):
+                    trans_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            
             canvas.bind_all("<MouseWheel>", _on_mousewheel)
-    
+
+    def apply_window_transmission_correction(self, signals_dict):
+        """
+        Apply window transmission correction using user-input values
+        Accounts for thickness difference using Beer-Lambert law
+        """
+        
+        if not self.enable_window_correction.get():
+            return signals_dict
+        
+        corrected_signals = {}
+        reference_thickness = self.reference_thickness.get()
+        actual_thickness = self.actual_thickness.get()
+        
+        self.snr_text.insert(tk.END, f"\nAPPLYING WINDOW TRANSMISSION CORRECTION:\n")
+        self.snr_text.insert(tk.END, f"Reference thickness: {reference_thickness:.1f}mm\n")
+        self.snr_text.insert(tk.END, f"Actual thickness: {actual_thickness:.1f}mm\n")
+        self.snr_text.insert(tk.END, "-" * 50 + "\n")
+        
+        for detector, signal in signals_dict.items():
+            if detector in self.detector_transmissions:
+                # Get user-input transmission value (at reference thickness)
+                reference_transmission = self.detector_transmissions[detector].get()
+                
+                # Adjust transmission for actual thickness using Beer-Lambert law
+                # T_actual = T_reference ^ (actual_thickness / reference_thickness)
+                if reference_thickness > 0:
+                    thickness_ratio = actual_thickness / reference_thickness
+                    actual_transmission = reference_transmission ** thickness_ratio
+                else:
+                    actual_transmission = reference_transmission
+                
+                # Correct signal by dividing by transmission
+                corrected_signal = signal / actual_transmission
+                corrected_signals[detector] = corrected_signal
+                
+                # Get wavelength for logging
+                wavelength = self.detector_wavelengths[detector].get()
+                correction_factor = 1 / actual_transmission
+                
+                self.snr_text.insert(tk.END, 
+                    f"{detector} ({wavelength:.0f}nm): "
+                    f"T_ref={reference_transmission:.3f}, "
+                    f"T_actual={actual_transmission:.3f}, "
+                    f"Correction={correction_factor:.2f}x\n")
+            else:
+                # No transmission value provided, use uncorrected signal
+                corrected_signals[detector] = signal
+                wavelength = self.detector_wavelengths.get(detector, tk.DoubleVar(value=0)).get()
+                self.snr_text.insert(tk.END, 
+                    f"{detector} ({wavelength:.0f}nm): No transmission value - using uncorrected signal\n")
+        
+        return corrected_signals
+
+    def show_transmission_summary(self):
+        """Display transmission correction summary"""
+        
+        if not self.enable_window_correction.get():
+            return
+        
+        self.snr_text.insert(tk.END, f"\nTRANSMISSION CORRECTION SUMMARY:\n")
+        self.snr_text.insert(tk.END, "=" * 40 + "\n")
+        
+        reference_thickness = self.reference_thickness.get()
+        actual_thickness = self.actual_thickness.get()
+        thickness_ratio = actual_thickness / reference_thickness if reference_thickness > 0 else 1.0
+        
+        self.snr_text.insert(tk.END, f"Thickness scaling factor: {thickness_ratio:.3f}\n")
+        self.snr_text.insert(tk.END, f"{'Detector':<12} {'Wavelength':<12} {'T_input':<10} {'T_actual':<10} {'Correction':<10}\n")
+        self.snr_text.insert(tk.END, "-" * 60 + "\n")
+        
+        for detector in self.good_detectors:
+            if detector in self.detector_transmissions:
+                wavelength = self.detector_wavelengths[detector].get()
+                t_input = self.detector_transmissions[detector].get()
+                t_actual = t_input ** thickness_ratio
+                correction = 1 / t_actual
+                
+                self.snr_text.insert(tk.END, 
+                    f"{detector:<12} {wavelength:<12.0f} {t_input:<10.3f} {t_actual:<10.3f} {correction:<10.2f}\n")
+
+
+    def get_matlab_style_corrected_signals(self):
+        """Get corrected signals with window transmission correction"""
+        
+        corrected_signals = {}
+        
+        # First apply basic dark subtraction
+        for detector in self.good_detectors:
+            if (detector in self.processed_data['experimental'] and
+                detector in self.processed_data['dark']):
+                
+                exp_signal = self.processed_data['experimental'][detector]['signal']
+                dark_signal = self.processed_data['dark'][detector]['signal']
+                
+                # MATLAB-style: simple mean dark subtraction
+                dark_mean = np.mean(dark_signal)
+                corrected = exp_signal - dark_mean
+                
+                # Ensure positive values
+                corrected = np.maximum(corrected, 1e-12)
+                
+                corrected_signals[detector] = corrected
+        
+        # Then apply window transmission correction
+        corrected_signals = self.apply_window_transmission_correction(corrected_signals)
+        
+        return corrected_signals
+
     def setup_files_tab(self):
         """Setup folder selection tab"""
         
@@ -526,14 +818,20 @@ class PyrometerApp:
                 command=self.plot_snr_vs_time).pack(side='left', padx=5)
         
     def planck_function(self, wavelength_nm, temperature):
-        """Calculate Planck function for given wavelength (nm) and temperature (K)"""
-        wavelength_m = wavelength_nm * 1e-9  # Convert nm to m
+        """Calculate Planck function exactly like MATLAB"""
+        wavelength_m = wavelength_nm * 1e-9
+        
         try:
-            result = (2 * self.h * self.c**2 / wavelength_m**5) / \
-                    (np.exp(self.h * self.c / (wavelength_m * self.k * temperature)) - 1)
+            # MATLAB: C1/lam^5 * (exp(C2/(lam*T))-1)^-1
+            C1 = 2 * self.h * self.c**2
+            C2 = self.h * self.c / self.k
+            
+            exp_term = np.exp(C2 / (wavelength_m * temperature))
+            result = (C1 / wavelength_m**5) / (exp_term - 1)
+            
             return result
         except:
-            return 1e-10  # Return small value if calculation fails
+            return 1e-10
     
     def calculate_snr(self, signal):
         """Calculate comprehensive signal-to-noise ratio metrics with rolling SNR analysis"""
@@ -624,444 +922,381 @@ class PyrometerApp:
             return 0, False, {}
     
     def check_snr(self):
-        """Check SNR for all loaded files using comprehensive analysis"""
+        """Check SNR for fully corrected signals using proper MATLAB pipeline"""
         
         self.snr_text.delete(1.0, tk.END)
         self.snr_results = {}
         
         num_detectors = self.num_detectors.get()
         threshold = self.snr_threshold.get()
-        percentage_threshold = self.snr_percentage.get()  # ADD this line
+        percentage_threshold = self.snr_percentage.get()
         
-        self.snr_text.insert(tk.END, "COMPREHENSIVE SNR ANALYSIS RESULTS\n")
+        self.snr_text.insert(tk.END, "SNR ANALYSIS ON MATLAB-STYLE CORRECTED SIGNALS\n")
         self.snr_text.insert(tk.END, "="*60 + "\n")
-        self.snr_text.insert(tk.END, f"Number of detectors: {num_detectors}\n")
-        self.snr_text.insert(tk.END, f"SNR Threshold: {threshold}\n")
-        self.snr_text.insert(tk.END, f"Required Good Time: {percentage_threshold}%\n\n")
+        self.snr_text.insert(tk.END, "Pipeline: Dark subtraction → Calibration scaling → Window correction\n\n")
         
-        for category in self.file_categories:
-            self.snr_text.insert(tk.END, f"{category.upper()} FILES:\n")
-            self.snr_text.insert(tk.END, "-"*50 + "\n")
-            self.snr_results[category] = {}
-            
-            detector_data = {}  # For detector comparisons
-            
-            for i in range(num_detectors):
-                detector_name = f"detector{i+1}"
-                
-                if (category in self.processed_data and 
-                    detector_name in self.processed_data[category]):
-                    
-                    signal_data = self.processed_data[category][detector_name]['signal']
-                    rms_snr, is_good, metrics = self.calculate_snr(signal_data)
-                    
-                    self.snr_results[category][detector_name] = {
-                        'snr': rms_snr,
-                        'is_good': is_good,
-                        'metrics': metrics,
-                        'time': self.processed_data[category][detector_name]['time'],
-                        'signal': signal_data
-                    }
-                    
-                    detector_data[detector_name] = signal_data
-                    
-                    status = "✓ GOOD" if is_good else "✗ POOR"
-                    wavelength = self.detector_wavelengths.get(detector_name, tk.DoubleVar(value=0)).get()
-                    
-                    self.snr_text.insert(tk.END, f"  C{i+1} ({wavelength:.1f}nm):\n")
-                    self.snr_text.insert(tk.END, f"    Mean Signal:     {metrics['mean_signal']:.3e}\n")
-                    self.snr_text.insert(tk.END, f"    Std Deviation:   {metrics['std_signal']:.3e}\n")
-                    self.snr_text.insert(tk.END, f"    SNR (mean/std):  {metrics['snr']:.1f}\n")
-                    self.snr_text.insert(tk.END, f"    RMS Noise:       {metrics['rms_noise']:.3e}\n")
-                    self.snr_text.insert(tk.END, f"    RMS SNR:         {metrics['rms_snr']:.1f}\n")
-                    self.snr_text.insert(tk.END, f"    Rolling SNR:     {metrics['rolling_snr_mean']:.1f} ± {metrics['rolling_snr_std']:.1f}\n")
-                    self.snr_text.insert(tk.END, f"    Good SNR Time:   {metrics['percentage_good']:.1f}% {status}\n")
-                    self.snr_text.insert(tk.END, f"    Window Size:     {metrics['window_size']} points\n")
-                    self.snr_text.insert(tk.END, f"    Peak-Peak:       {metrics['pp_noise']:.3e}\n")
-                    self.snr_text.insert(tk.END, f"    Dynamic Range:   {metrics['dynamic_range']:.1f} dB\n")
-                    self.snr_text.insert(tk.END, f"    Quality:         {metrics['quality']}\n")
-                    self.snr_text.insert(tk.END, "\n")
-                    
-                else:
-                    self.snr_text.insert(tk.END, f"  C{i+1}: No data found\n\n")
-            
-            # Add detector comparisons
-            if len(detector_data) >= 2:
-                self.snr_text.insert(tk.END, "  Detector Comparison:\n")
-                detector_names = list(detector_data.keys())
-                for i in range(len(detector_names)):
-                    for j in range(i+1, len(detector_names)):
-                        det1, det2 = detector_names[i], detector_names[j]
-                        ratio = np.mean(detector_data[det1]) / np.mean(detector_data[det2])
-                        ratio_std = np.std(detector_data[det1] / detector_data[det2])
-                        self.snr_text.insert(tk.END, f"    {det1}/{det2} ratio: {ratio:.3f} ± {ratio_std:.3f}\n")
-                self.snr_text.insert(tk.END, "\n")
-            
-            self.snr_text.insert(tk.END, "\n")
-        
-        # Determine which detectors to use - only check experimental data SNR
-        self.good_detectors = []
-        
+        # First determine which detectors have all required data
+        available_detectors = []
         for i in range(num_detectors):
             detector_name = f"detector{i+1}"
-            
-            # Only check experimental data SNR
-            if ('experimental' in self.snr_results and 
-                detector_name in self.snr_results['experimental']):
-                
-                if self.snr_results['experimental'][detector_name]['is_good']:
-                    self.good_detectors.append(detector_name)
-                    print(f"DEBUG: {detector_name} added - experimental good time = {self.snr_results['experimental'][detector_name]['metrics']['percentage_good']:.1f}%")
-                else:
-                    print(f"DEBUG: {detector_name} excluded - experimental good time = {self.snr_results['experimental'][detector_name]['metrics']['percentage_good']:.1f}% < {percentage_threshold}%")
-            else:
-                print(f"DEBUG: {detector_name} excluded - no experimental data found")
+            if (detector_name in self.processed_data.get('experimental', {}) and
+                detector_name in self.processed_data.get('dark', {}) and
+                detector_name in self.processed_data.get('calibration', {})):
+                available_detectors.append(detector_name)
         
-        self.snr_text.insert(tk.END, "SUMMARY:\n")
-        self.snr_text.insert(tk.END, "="*30 + "\n")
-        self.snr_text.insert(tk.END, f"SNR Threshold: {threshold}\n")
-        self.snr_text.insert(tk.END, f"Required Good Time: {percentage_threshold}%\n")
-        self.snr_text.insert(tk.END, f"Good detectors: {', '.join(self.good_detectors)}\n")
-        self.snr_text.insert(tk.END, f"Poor detectors excluded: {num_detectors - len(self.good_detectors)}\n")
-
-        # Show which detectors were excluded and why
-        for i in range(num_detectors):
-            detector_name = f"detector{i+1}"
-            if detector_name not in self.good_detectors:
-                if ('experimental' in self.snr_results and 
-                    detector_name in self.snr_results['experimental']):
-                    percentage_good = self.snr_results['experimental'][detector_name]['metrics']['percentage_good']
-                    self.snr_text.insert(tk.END, f"  {detector_name} excluded: good SNR time = {percentage_good:.1f}% < {percentage_threshold}%\n")
-                else:
-                    self.snr_text.insert(tk.END, f"  {detector_name} excluded: no experimental data found\n")
-
+        if not available_detectors:
+            self.snr_text.insert(tk.END, "No detectors have all required data (experimental, dark, calibration)\n")
+            return
+        
+        # Temporarily set good_detectors to all available for correction pipeline
+        self.good_detectors = available_detectors
+        
+        # Get fully corrected signals using MATLAB pipeline
+        corrected_signals = self.get_matlab_corrected_signals()
+        
+        # Now evaluate SNR and determine truly good detectors
+        final_good_detectors = []
+        
+        for detector_name in available_detectors:
+            if detector_name in corrected_signals:
+                fully_corrected = corrected_signals[detector_name]
+                
+                # Calculate SNR on fully corrected signal
+                rms_snr, is_good, metrics = self.calculate_snr(fully_corrected)
+                
+                # Store results
+                self.snr_results['corrected'] = self.snr_results.get('corrected', {})
+                self.snr_results['corrected'][detector_name] = {
+                    'snr': rms_snr,
+                    'is_good': is_good,
+                    'metrics': metrics,
+                    'time': self.processed_data['experimental'][detector_name]['time'],
+                    'signal': fully_corrected
+                }
+                
+                if is_good:
+                    final_good_detectors.append(detector_name)
+                
+                # Display results
+                status = "✓ GOOD" if is_good else "✗ POOR"
+                wavelength = self.detector_wavelengths.get(detector_name, tk.DoubleVar(value=0)).get()
+                
+                self.snr_text.insert(tk.END, f"  {detector_name} ({wavelength:.1f}nm):\n")
+                self.snr_text.insert(tk.END, f"    Final Corrected Mean: {metrics['mean_signal']:.3e}\n")
+                self.snr_text.insert(tk.END, f"    RMS SNR:              {metrics['rms_snr']:.1f} {status}\n")
+                self.snr_text.insert(tk.END, f"    Good SNR Time:        {metrics['percentage_good']:.1f}%\n\n")
+        
+        # Update good_detectors with final results
+        self.good_detectors = final_good_detectors
+        
+        # Summary
+        self.snr_text.insert(tk.END, f"FINAL SUMMARY:\n")
+        self.snr_text.insert(tk.END, f"Available detectors: {len(available_detectors)}\n")
+        self.snr_text.insert(tk.END, f"Good detectors: {', '.join(self.good_detectors)} ({len(self.good_detectors)} total)\n")
+        
         if len(self.good_detectors) >= 2:
-            self.snr_text.insert(tk.END, f"\n✓ Ready for {len(self.good_detectors)}-color pyrometry!\n")
-        elif len(self.good_detectors) == 1:
-            self.snr_text.insert(tk.END, "\n⚠ Only 1 good detector - need at least 2 for ratio pyrometry\n")
+            self.snr_text.insert(tk.END, f"✓ Ready for {len(self.good_detectors)}-color pyrometry!\n")
         else:
-            self.snr_text.insert(tk.END, "\n✗ No detectors meet SNR threshold!\n")
+            self.snr_text.insert(tk.END, f"✗ Need at least 2 good detectors for pyrometry\n")
         
-        # Auto-scroll to bottom
         self.snr_text.see(tk.END)
-            
-    def plot_snr_vs_time(self):
-        """Plot SNR vs time for all detectors"""
-        
-        if 'experimental' not in self.snr_results:
-            messagebox.showwarning("No Data", "No SNR data available. Run SNR check first.")
-            return
-        
-        try:
-            # Clear the third subplot
-            self.axes[2].clear()
-            
-            colors = ['red', 'green', 'blue', 'orange', 'purple']
-            threshold = self.snr_threshold.get()
-            
-            for i, (detector, data) in enumerate(self.snr_results['experimental'].items()):
-                if 'rolling_snr' in data['metrics']:
-                    rolling_snr = data['metrics']['rolling_snr']
-                    time_data = data['time']
-                    
-                    # Create time axis for rolling SNR (centered in windows)
-                    window_size = data['metrics']['window_size']
-                    rolling_time = time_data[window_size//2:window_size//2 + len(rolling_snr)]
-                    
-                    # Get wavelength for label
-                    wavelength = self.detector_wavelengths.get(detector, tk.DoubleVar(value=0)).get()
-                    
-                    # Plot rolling SNR
-                    color = colors[i % len(colors)]
-                    self.axes[2].plot(rolling_time, rolling_snr, 
-                                    color=color, linewidth=2, 
-                                    label=f'{detector} ({wavelength:.0f}nm) - {data["metrics"]["percentage_good"]:.1f}% good')
-            
-            # Add threshold line
-            self.axes[2].axhline(y=threshold, color='red', linestyle='--', 
-                                alpha=0.7, linewidth=2, label=f'SNR Threshold ({threshold})')
-            
-            self.axes[2].set_xlabel('Time (s)')
-            self.axes[2].set_ylabel('Rolling SNR')
-            self.axes[2].set_title('Rolling SNR vs Time (Experimental Data)')
-            self.axes[2].legend()
-            self.axes[2].grid(True, alpha=0.3)
-            self.axes[2].set_ylim(0, max(10, threshold * 3))  # Dynamic y-limit
-            
-            self.fig.tight_layout()
-            self.canvas.draw()
-            
-            print("DEBUG: SNR vs Time plot completed")
-            
-        except Exception as e:
-            print(f"DEBUG: Error plotting SNR vs time: {e}")
-            messagebox.showerror("Error", f"Error plotting SNR vs time: {str(e)}")        
-
-    def plot_rolling_snr(self):
-        """Plot rolling SNR analysis for experimental data"""
-        
-        if 'experimental' not in self.snr_results:
-            return
-        
-        fig, axes = plt.subplots(len(self.snr_results['experimental']), 1, figsize=(12, 8))
-        if len(self.snr_results['experimental']) == 1:
-            axes = [axes]
-        
-        colors = ['red', 'green', 'blue']
-        threshold = self.snr_threshold.get()
-        
-        for i, (detector, data) in enumerate(self.snr_results['experimental'].items()):
-            if 'rolling_snr' in data['metrics']:
-                rolling_snr = data['metrics']['rolling_snr']
-                time_data = data['time']
                 
-                # Create time axis for rolling SNR (centered in windows)
-                window_size = data['metrics']['window_size']
-                rolling_time = time_data[window_size//2:window_size//2 + len(rolling_snr)]
+        def plot_snr_vs_time(self):
+            """Plot SNR vs time for corrected signals"""
+            
+            if 'corrected' not in self.snr_results:
+                messagebox.showwarning("No Data", "No corrected SNR data available. Run SNR check first.")
+                return
+            
+            try:
+                # Clear the third subplot
+                self.axes[2].clear()
                 
-                axes[i].plot(rolling_time, rolling_snr, color=colors[i], linewidth=1, label=f'{detector} Rolling SNR')
-                axes[i].axhline(y=threshold, color='red', linestyle='--', alpha=0.7, label=f'Threshold ({threshold})')
-                axes[i].set_ylabel('Rolling SNR')
-                axes[i].set_title(f'{detector} - {data["metrics"]["percentage_good"]:.1f}% above threshold')
-                axes[i].legend()
-                axes[i].grid(True, alpha=0.3)
-        
-        axes[-1].set_xlabel('Time (s)')
-        plt.tight_layout()
-        plt.show()
+                colors = ['red', 'green', 'blue', 'orange', 'purple', 'brown', 'pink', 'gray']
+                threshold = self.snr_threshold.get()
+                
+                for i, (detector, data) in enumerate(self.snr_results['corrected'].items()):
+                    if 'rolling_snr' in data['metrics']:
+                        rolling_snr = data['metrics']['rolling_snr']
+                        time_data = data['time']
+                        
+                        # Create time axis for rolling SNR (centered in windows)
+                        window_size = data['metrics']['window_size']
+                        rolling_time = time_data[window_size//2:window_size//2 + len(rolling_snr)]
+                        
+                        # Get wavelength and correction info for label
+                        wavelength = self.detector_wavelengths.get(detector, tk.DoubleVar(value=0)).get()
+                        correction_factor = data['transmission_correction_factor']
+                        
+                        # Plot rolling SNR
+                        color = colors[i % len(colors)]
+                        line_style = '-' if data['is_good'] else '--'
+                        alpha = 1.0 if data['is_good'] else 0.6
+                        
+                        label = f'{detector} ({wavelength:.0f}nm, {correction_factor:.1f}x) - {data["metrics"]["percentage_good"]:.1f}% good'
+                        
+                        self.axes[2].plot(rolling_time, rolling_snr, 
+                                        color=color, linewidth=2, linestyle=line_style, alpha=alpha,
+                                        label=label)
+                
+                # Add threshold line
+                self.axes[2].axhline(y=threshold, color='red', linestyle=':', 
+                                    alpha=0.8, linewidth=2, label=f'SNR Threshold ({threshold})')
+                
+                self.axes[2].set_xlabel('Time (s)')
+                self.axes[2].set_ylabel('Rolling SNR (Corrected Signals)')
+                self.axes[2].set_title('Rolling SNR vs Time (Dark + Window Corrected)')
+                self.axes[2].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                self.axes[2].grid(True, alpha=0.3)
+                self.axes[2].set_ylim(0, max(10, threshold * 3))
+                
+                self.fig.tight_layout()
+                self.canvas.draw()
+                
+                print("DEBUG: Corrected SNR vs Time plot completed")
+                
+            except Exception as e:
+                print(f"DEBUG: Error plotting corrected SNR vs time: {e}")
+                messagebox.showerror("Error", f"Error plotting SNR vs time: {str(e)}") 
 
+
+    def calculate_matlab_calibration_factors(self):
+        """Calculate calibration factors for temperature calculation (ratios only)"""
+        
+        all_cal_factors = {}
+        
+        for temp, description in self.calibration_temps:
+            cal_factors = {}
+            
+            self.snr_text.insert(tk.END, f"\nCalculation ratios for {temp}K ({description}):\n")
+            
+            for detector in self.good_detectors:
+                # For temperature calculation, we just need the ratio correction
+                # The absolute scaling was already applied in signal correction
+                wavelength = self.detector_wavelengths[detector].get()
+                theoretical = self.planck_function(wavelength, temp)
+                
+                # Simple ratio factor (since signals are already calibration-scaled)
+                cal_factors[detector] = theoretical
+                
+                self.snr_text.insert(tk.END, 
+                    f"  {detector}: theoretical_intensity={theoretical:.2e}\n")
+            
+            all_cal_factors[temp] = cal_factors
+            
+        return all_cal_factors
+
+    def get_matlab_corrected_signals(self):
+        """Get corrected signals using MATLAB methodology with proper calibration scaling"""
+        
+        corrected_signals = {}
+        
+        self.snr_text.insert(tk.END, f"MATLAB-style signal correction:\n")
+        self.snr_text.insert(tk.END, f"1. Dark subtraction: experimental - dark_mean\n")
+        self.snr_text.insert(tk.END, f"2. Window transmission correction (if enabled)\n")
+        self.snr_text.insert(tk.END, f"3. Calibration scaling based on reference temperature\n\n")
+        
+        # Get calibration factors for scaling
+        calibration_factors = {}
+        reference_temp = self.calibration_temps[0][0]  # Use first calibration temp as reference
+        
+        for detector in self.good_detectors:
+            if (detector in self.processed_data['calibration'] and
+                detector in self.processed_data['dark']):
+                
+                cal_signal = self.processed_data['calibration'][detector]['signal']
+                dark_signal = self.processed_data['dark'][detector]['signal']
+                
+                # MATLAB-style calibration factor calculation
+                dark_mean = np.mean(dark_signal)
+                cal_corrected = cal_signal - dark_mean
+                
+                # Use stable middle region
+                start_idx = len(cal_corrected) // 4
+                end_idx = 3 * len(cal_corrected) // 4
+                stable_cal_signal = np.mean(cal_corrected[start_idx:end_idx])
+                
+                # Calculate theoretical Planck intensity at reference temperature
+                wavelength = self.detector_wavelengths[detector].get()
+                theoretical_intensity = self.planck_function(wavelength, reference_temp)
+                
+                # Calibration factor (like MATLAB intensity correction)
+                calibration_factors[detector] = stable_cal_signal / theoretical_intensity
+                
+                self.snr_text.insert(tk.END, 
+                    f"Calibration factor for {detector}: {calibration_factors[detector]:.2e}\n")
+        
+        # Now correct experimental signals
+        for detector in self.good_detectors:
+            if (detector in self.processed_data['experimental'] and
+                detector in self.processed_data['dark']):
+                
+                exp_signal = self.processed_data['experimental'][detector]['signal']
+                dark_signal = self.processed_data['dark'][detector]['signal']
+                
+                # Step 1: MATLAB-style dark subtraction
+                dark_mean = np.mean(dark_signal)
+                dark_corrected = exp_signal - dark_mean
+                dark_corrected = np.maximum(dark_corrected, 1e-12)
+                
+                # Step 2: Apply calibration scaling (like MATLAB correction factors)
+                if detector in calibration_factors:
+                    calibration_scaled = dark_corrected / calibration_factors[detector]
+                else:
+                    calibration_scaled = dark_corrected
+                
+                # Step 3: Window transmission correction (if enabled)
+                if self.enable_window_correction.get() and detector in self.detector_transmissions:
+                    reference_transmission = self.detector_transmissions[detector].get()
+                    reference_thickness = self.reference_thickness.get()
+                    actual_thickness = self.actual_thickness.get()
+                    
+                    if reference_thickness > 0:
+                        thickness_ratio = actual_thickness / reference_thickness
+                        actual_transmission = reference_transmission ** thickness_ratio
+                    else:
+                        actual_transmission = reference_transmission
+                    
+                    final_corrected = calibration_scaled / actual_transmission
+                    window_factor = 1 / actual_transmission
+                else:
+                    final_corrected = calibration_scaled
+                    window_factor = 1.0
+                
+                corrected_signals[detector] = final_corrected
+                
+                wavelength = self.detector_wavelengths[detector].get()
+                cal_factor = calibration_factors.get(detector, 1.0)
+                
+                self.snr_text.insert(tk.END, 
+                    f"{detector} ({wavelength:.0f}nm): "
+                    f"dark_corr={np.mean(dark_corrected):.2e}, "
+                    f"cal_scaled={np.mean(calibration_scaled):.2e}, "
+                    f"final={np.mean(final_corrected):.2e}, "
+                    f"cal_factor={cal_factor:.2e}, window_factor={window_factor:.2f}\n")
+        
+        return corrected_signals
 
     def calculate_temperature(self):
-        """Calculate temperature using ratio pyrometry with multiple calibration points"""
+        """Calculate temperature using MATLAB methodology: numerical solver + all possible ratios"""
         
         if len(self.good_detectors) < 2:
             messagebox.showerror("Error", 
-                               f"Need at least 2 detectors with good SNR!\n"
-                               f"Currently have: {len(self.good_detectors)}")
+                            f"Need at least 2 detectors with good SNR!\n"
+                            f"Currently have: {len(self.good_detectors)}")
             return
         
         try:
-            # Use first two good detectors for now
-            det1, det2 = self.good_detectors[0], self.good_detectors[1]
+            self.snr_text.insert(tk.END, f"\nCALCULATING TEMPERATURE (MATLAB-style: numerical solver + all ratios)...\n")
+            self.snr_text.insert(tk.END, "="*70 + "\n")
             
-            self.snr_text.insert(tk.END, f"\nCALCULATING TEMPERATURE using {det1} and {det2}...\n")
-            self.snr_text.insert(tk.END, "="*50 + "\n")
-            
-            # Get wavelengths
-            lambda1 = self.detector_wavelengths[det1].get()  # nm
-            lambda2 = self.detector_wavelengths[det2].get()  # nm
-            
-            self.snr_text.insert(tk.END, f"Wavelengths: {lambda1:.1f}nm and {lambda2:.1f}nm\n")
-            self.snr_text.insert(tk.END, f"Calibration temperatures: {[temp for temp, _ in self.calibration_temps]}\n")
-            
-            # Get corrected signals
-            corrected_signals = {}
-            corrected_time = None
-
-            for detector in [det1, det2]:
-                if (detector in self.processed_data['experimental'] and
-                    detector in self.processed_data['background'] and
-                    detector in self.processed_data['dark']):
-                    exp_signal = self.processed_data['experimental'][detector]['signal']
-                    bg_signal = self.processed_data['background'][detector]['signal']
-                    dark_signal = self.processed_data['dark'][detector]['signal']
-                
-                    min_length = min(len(exp_signal), len(bg_signal), len(dark_signal))
-                    
-                    # Correct signals: (Experimental - Dark) - (Background - Dark)
-                    corrected = (exp_signal[:min_length] - dark_signal[:min_length]) - \
-                               (bg_signal[:min_length] - dark_signal[:min_length])
-                    corrected = np.maximum(corrected, 1e-10)  # Avoid negative values
-                    
-                    corrected_signals[detector] = corrected
-                    
-                    if corrected_time is None:
-                        corrected_time = self.processed_data['experimental'][detector]['time'][:min_length]
-                    
-                    self.snr_text.insert(tk.END, 
-                        f"{detector} corrected signal range: {corrected.min():.2e} to {corrected.max():.2e}\n")
+            # Get corrected signals (MATLAB-style: experimental - dark only)
+            corrected_signals = self.get_matlab_corrected_signals()
             
             if len(corrected_signals) < 2:
-                raise ValueError("Could not correct signals for both detectors")
+                raise ValueError("Could not correct signals for at least 2 detectors")
             
             # Calculate calibration factors for each calibration temperature
-            all_cal_factors = {}
+            all_cal_factors = self.calculate_matlab_calibration_factors()
             
-            for temp, description in self.calibration_temps:
-                cal_factors = {}
-                
-                self.snr_text.insert(tk.END, f"\nCalculating calibration factors for {temp}K ({description}):\n")
-                
-                for detector in [det1, det2]:
-                    if (detector in self.processed_data['calibration'] and
-                        detector in self.processed_data['dark']):
-                        
-                        cal_signal = self.processed_data['calibration'][detector]['signal']
-                        dark_signal = self.processed_data['dark'][detector]['signal']
-                        
-                        min_length = min(len(cal_signal), len(dark_signal))
-                        corrected_cal = cal_signal[:min_length] - dark_signal[:min_length]
-                        corrected_cal = np.maximum(corrected_cal, 1e-10)
-                        
-                        # Get wavelength and calculate theoretical Planck function
-                        wavelength = self.detector_wavelengths[detector].get()
-                        theoretical = self.planck_function(wavelength, temp)
-                        
-                        # Use stable region (middle 50% of data)
-                        start_idx = len(corrected_cal) // 4
-                        end_idx = 3 * len(corrected_cal) // 4
-                        stable_signal = np.mean(corrected_cal[start_idx:end_idx])
-                        
-                        cal_factors[detector] = stable_signal / theoretical
-                        
-                        self.snr_text.insert(tk.END, 
-                            f"  {detector}: {cal_factors[detector]:.2e}\n")
-                
-                all_cal_factors[temp] = cal_factors
+            # Generate ALL possible detector combinations (like MATLAB's 3 ratios)
+            detector_names = list(corrected_signals.keys())
+            all_temperature_arrays = []
+            combination_descriptions = []
             
-            # Calculate temperature using each calibration point
-            temperature_results = []
-            temperature_descriptions = []
+            self.snr_text.insert(tk.END, f"Using {len(detector_names)} good detectors: {', '.join(detector_names)}\n")
             
-            for temp, description in self.calibration_temps:
-                if temp in all_cal_factors and len(all_cal_factors[temp]) >= 2:
-                    cal_factors = all_cal_factors[temp]
+            # Calculate temperature for ALL detector pair combinations
+            for i in range(len(detector_names)):
+                for j in range(i+1, len(detector_names)):
+                    det1, det2 = detector_names[i], detector_names[j]
+                    lambda1 = self.detector_wavelengths[det1].get()
+                    lambda2 = self.detector_wavelengths[det2].get()
                     
-                    # Calculate temperature using ratio pyrometry
-                    ratio = corrected_signals[det1] / corrected_signals[det2]
+                    self.snr_text.insert(tk.END, f"\nRatio {det1}({lambda1:.0f}nm) / {det2}({lambda2:.0f}nm):\n")
                     
-                    # Apply smoothing to ratio
-                    ratio_smooth = gaussian_filter1d(ratio, sigma=5)
-                    
-                    # Apply calibration correction
-                    cal_ratio = cal_factors[det1] / cal_factors[det2]
-                    corrected_ratio = ratio_smooth / cal_ratio
-                    corrected_ratio = np.maximum(corrected_ratio, 1e-10)
-                    
-                    # Wien's law temperature calculation
-                    # Wien's law temperature calculation - CORRECTED VERSION
-                    C2 = self.h * self.c / self.k  # Second radiation constant
-                    lambda1_m = lambda1 * 1e-9  # Convert to meters
-                    lambda2_m = lambda2 * 1e-9
-
-                    # Calculate theoretical ratio at calibration temperature (for display)
-                    theoretical_ratio = self.planck_function(lambda1, temp) / self.planck_function(lambda2, temp)
-                    self.snr_text.insert(tk.END, f"Theoretical ratio at {temp}K: {theoretical_ratio:.4f}\n")
-                    self.snr_text.insert(tk.END, f"Mean measured ratio: {np.mean(corrected_ratio):.4f}\n")
-
-                    # Calculate the wavelength-dependent terms (use meters!)
-                    wavelength_factor = (1/lambda2_m - 1/lambda1_m)  # This will be negative
-                    wavelength_ratio_term = 5 * np.log(lambda2_m/lambda1_m)
-
-                    self.snr_text.insert(tk.END, f"Wavelength factor (1/λ2 - 1/λ1): {wavelength_factor:.2e}\n")
-                    self.snr_text.insert(tk.END, f"Wavelength ratio term 5*ln(λ2/λ1): {wavelength_ratio_term:.4f}\n")
-
-                    # Initialize temperature list
-                    temperature = []
-
-                    # Calculate temperature for each point
-                    for i, ratio_val in enumerate(corrected_ratio):
-                        try:
-                            # Proper Wien's law formula
-                            log_ratio = np.log(ratio_val)
-                            denominator = log_ratio - wavelength_ratio_term
+                    # Calculate for each calibration temperature
+                    for temp, description in self.calibration_temps:
+                        if temp in all_cal_factors:
+                            cal_factors = all_cal_factors[temp]
                             
-                            if abs(denominator) > 1e-10:  # Avoid division by zero
-                                T_point = C2 * wavelength_factor / denominator
+                            if det1 in cal_factors and det2 in cal_factors:
+                                # Use numerical Planck solver (like MATLAB fzero)
+                                temperature_array = self.solve_planck_numerical(
+                                    corrected_signals[det1], 
+                                    corrected_signals[det2],
+                                    lambda1, lambda2, 
+                                    cal_factors[det1], cal_factors[det2],
+                                    calibration_temp=temp
+                                )
                                 
-                                # The temperature should be positive
-                                if T_point > 0:
-                                    temperature.append(T_point)
+                                all_temperature_arrays.append(temperature_array)
+                                combo_desc = f"{det1}/{det2} @ {temp}K {description}"
+                                combination_descriptions.append(combo_desc)
+                                
+                                # Statistics for this combination
+                                valid_temps = temperature_array[np.isfinite(temperature_array)]
+                                if len(valid_temps) > 0:
+                                    self.snr_text.insert(tk.END, 
+                                        f"  {temp}K cal: {valid_temps.mean():.0f}K "
+                                        f"(range: {valid_temps.min():.0f}-{valid_temps.max():.0f}K, "
+                                        f"{len(valid_temps)}/{len(temperature_array)} valid)\n")
                                 else:
-                                    # If negative, try the reciprocal
-                                    T_point = -T_point
-                                    temperature.append(T_point)
-                            else:
-                                temperature.append(temp)  # Default to calibration temperature
-                                
-                        except (ValueError, RuntimeWarning, ZeroDivisionError):
-                            temperature.append(temp)
-
-                    # Convert to numpy array
-                    temperature = np.array(temperature)
-
-                    # Filter unrealistic temperatures BEFORE smoothing
-                    temperature = np.clip(temperature, 300, 8000)
-
-                    # Apply smoothing to temperature
-                    smooth_sig = self.smoothing_window.get()
-                    temperature_smooth = gaussian_filter1d(temperature, sigma=smooth_sig)
-
-                    # Final clipping after smoothing
-                    temperature_smooth = np.clip(temperature_smooth, 300, 8000)
-                                        
-                    temperature_results.append(temperature_smooth)
-                    temperature_descriptions.append(f"{temp}K {description}")
-                    
-                    self.snr_text.insert(tk.END, 
-                        f"\nUsing {temp}K calibration:\n")
-                    self.snr_text.insert(tk.END, 
-                        f"  Temperature range: {temperature_smooth.min():.0f}K to {temperature_smooth.max():.0f}K\n")
-                    self.snr_text.insert(tk.END, 
-                        f"  Average temperature: {temperature_smooth.mean():.0f}K\n")
+                                    self.snr_text.insert(tk.END, f"  {temp}K cal: No valid temperatures\n")
             
-            if not temperature_results:
-                raise ValueError("No valid temperature calculations from calibration data")
+            if not all_temperature_arrays:
+                raise ValueError("No valid temperature calculations from any detector combination")
             
-            # Calculate statistics if multiple calibrations
-            if len(temperature_results) > 1:
-                # Calculate mean and standard deviation across calibrations
-                temp_array = np.array(temperature_results)
-                mean_temperature = np.mean(temp_array, axis=0)
-                std_temperature = np.std(temp_array, axis=0)
-                
-                self.snr_text.insert(tk.END, f"\nMULTI-CALIBRATION STATISTICS:\n")
-                self.snr_text.insert(tk.END, f"Mean temperature: {mean_temperature.mean():.0f} ± {std_temperature.mean():.0f}K\n")
-                self.snr_text.insert(tk.END, f"Temperature range: {mean_temperature.min():.0f}K to {mean_temperature.max():.0f}K\n")
-                
-                # Store results with uncertainty
-                self.temperature_results = {
-                    'time': corrected_time,
-                    'temperature_individual': temperature_results,
-                    'temperature_descriptions': temperature_descriptions,
-                    'temperature_mean': mean_temperature,
-                    'temperature_std': std_temperature,
-                    'corrected_signals': corrected_signals,
-                    'detectors_used': [det1, det2],
-                    'wavelengths': [lambda1, lambda2],
-                    'has_uncertainty': True
-                }
-            else:
-                # Single calibration result
-                self.temperature_results = {
-                    'time': corrected_time,
-                    'temperature': temperature_results[0],
-                    'temperature_smooth': temperature_results[0],
-                    'corrected_signals': corrected_signals,
-                    'detectors_used': [det1, det2],
-                    'wavelengths': [lambda1, lambda2],
-                    'has_uncertainty': False
-                }
+            # Average ALL temperature arrays (like MATLAB T_P1_AVG)
+            self.snr_text.insert(tk.END, f"\nAveraging {len(all_temperature_arrays)} temperature arrays...\n")
+            
+            # Convert to numpy array and calculate mean (ignoring NaN)
+            all_temps_array = np.array(all_temperature_arrays)
+            mean_temperature = np.nanmean(all_temps_array, axis=0)
+            std_temperature = np.nanstd(all_temps_array, axis=0)
+            
+            # Apply smoothing (like MATLAB)
+            smooth_window = self.smoothing_window.get()
+            mean_temperature_smooth = gaussian_filter1d(mean_temperature, sigma=smooth_window)
+            std_temperature_smooth = gaussian_filter1d(std_temperature, sigma=smooth_window)
+            
+            # Clip unrealistic temperatures
+            mean_temperature_smooth = np.clip(mean_temperature_smooth, 300, 8000)
+            
+            # Store results
+            corrected_time = self.processed_data['experimental'][detector_names[0]]['time'][:len(mean_temperature_smooth)]
+            
+            self.temperature_results = {
+                'time': corrected_time,
+                'temperature_mean': mean_temperature_smooth,
+                'temperature_std': std_temperature_smooth,
+                'temperature_individual': all_temperature_arrays,
+                'temperature_descriptions': combination_descriptions,
+                'corrected_signals': corrected_signals,
+                'detectors_used': detector_names,
+                'wavelengths': [self.detector_wavelengths[det].get() for det in detector_names],
+                'has_uncertainty': True,
+                'method': 'MATLAB-style: Numerical Planck solver with all detector combinations',
+                'num_combinations': len(all_temperature_arrays)
+            }
             
             # Plot results
             self.plot_results()
-            
-            # Switch to results tab
             self.notebook.select(3)
             
-            self.snr_text.insert(tk.END, f"\n✓ Temperature calculation complete!\n")
-            self.snr_text.see(tk.END)
+            # Summary
+            valid_final = np.sum(np.isfinite(mean_temperature_smooth))
+            total_final = len(mean_temperature_smooth)
             
-            if len(temperature_results) > 1:
-                messagebox.showinfo("Success", 
-                                  f"Temperature calculated using {len(temperature_results)} calibration points!\n"
-                                  f"Using {det1} ({lambda1:.1f}nm) and {det2} ({lambda2:.1f}nm)\n"
-                                  f"Mean temperature: {mean_temperature.mean():.0f} ± {std_temperature.mean():.0f}K")
-            else:
-                messagebox.showinfo("Success", 
-                                  f"Temperature calculated successfully!\n"
-                                  f"Using {det1} ({lambda1:.1f}nm) and {det2} ({lambda2:.1f}nm)\n"
-                                  f"Average temperature: {temperature_results[0].mean():.0f}K")
+            self.snr_text.insert(tk.END, f"\n✓ MATLAB-style temperature calculation complete!\n")
+            self.snr_text.insert(tk.END, f"Detector combinations used: {len(all_temperature_arrays)}\n")
+            self.snr_text.insert(tk.END, f"Valid temperature points: {valid_final}/{total_final}\n")
+            self.snr_text.insert(tk.END, f"Final average: {np.nanmean(mean_temperature_smooth):.0f} ± {np.nanmean(std_temperature_smooth):.0f}K\n")
+            
+            messagebox.showinfo("Success", 
+                            f"MATLAB-style temperature calculated!\n"
+                            f"Used {len(all_temperature_arrays)} detector combinations\n"
+                            f"Final average: {np.nanmean(mean_temperature_smooth):.0f} ± {np.nanmean(std_temperature_smooth):.0f}K")
             
         except Exception as e:
             error_msg = f"Error calculating temperature: {str(e)}"
@@ -1194,6 +1429,88 @@ class PyrometerApp:
         else:
             messagebox.showwarning("No Data", "No temperature results to plot. Calculate temperature first.")
     
+
+    def solve_planck_numerical(self, signal1, signal2, lambda1, lambda2, cal_factor1, cal_factor2, calibration_temp):
+        """Solve Planck equation numerically like MATLAB fzero function"""
+        
+        # Calculate signal ratios
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio = signal1 / signal2
+        
+        # Apply calibration correction (like MATLAB correction factors)
+        cal_ratio = cal_factor1 / cal_factor2
+        corrected_ratio = ratio / cal_ratio
+        
+        # Apply smoothing to ratio (like MATLAB)
+        corrected_ratio = gaussian_filter1d(corrected_ratio, sigma=5)
+        
+        # Physical constants
+        C1 = 2 * self.h * self.c**2
+        C2 = self.h * self.c / self.k
+        
+        # Convert wavelengths to meters
+        lam1_m = lambda1 * 1e-9
+        lam2_m = lambda2 * 1e-9
+        
+        def planck_ratio_function(T, target_ratio):
+            """Planck ratio equation to solve (exactly like MATLAB func)"""
+            try:
+                if T <= 0:
+                    return 1e10
+                
+                # Calculate Planck functions (like MATLAB)
+                exp1 = np.exp(C2 / (lam1_m * T))
+                exp2 = np.exp(C2 / (lam2_m * T))
+                
+                if exp1 == np.inf or exp2 == np.inf:
+                    return 1e10
+                
+                planck1 = (C1 / lam1_m**5) / (exp1 - 1)
+                planck2 = (C1 / lam2_m**5) / (exp2 - 1)
+                
+                if planck2 == 0:
+                    return 1e10
+                
+                theoretical_ratio = planck1 / planck2
+                return target_ratio - theoretical_ratio
+                
+            except (OverflowError, ZeroDivisionError, RuntimeWarning):
+                return 1e10
+        
+        # Solve for each data point (like MATLAB loop)
+        temperature = np.full_like(corrected_ratio, np.nan)
+        
+        for i, ratio_val in enumerate(corrected_ratio):
+            if not np.isfinite(ratio_val) or ratio_val <= 0:
+                continue
+            
+            # Try multiple initial guesses (like MATLAB T0 = [3000 2000 4000])
+            solved = False
+            for T0 in [3000, 2000, 4000, 1500, 5000]:
+                try:
+                    # Use fsolve (like MATLAB fzero)
+                    T_solution = fsolve(
+                        lambda T: planck_ratio_function(T, ratio_val), 
+                        T0, 
+                        xtol=1.0  # 1K tolerance like MATLAB
+                    )[0]
+                    
+                    # Check bounds (like MATLAB: and(Temp1 >= 100,Temp1 <= 6000))
+                    if 100 <= T_solution <= 6000:
+                        temperature[i] = T_solution
+                        solved = True
+                        break
+                            
+                except:
+                    continue
+            
+            # If no solution, set to NaN (like MATLAB)
+            if not solved:
+                temperature[i] = np.nan
+        
+        return temperature
+
+
     def save_results(self):
         """Save results plot to file"""
         
